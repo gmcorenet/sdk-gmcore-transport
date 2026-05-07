@@ -1,0 +1,23 @@
+# Transport Configuration
+# Load from: config/transport.yaml, config/server.yaml, or transport.yaml
+
+server:
+  mode: both  # uds, tcp, or both
+
+  uds:
+    path: var/socket/app.sock
+    perm: 0660
+    group: gmcore
+    auto_remove: false
+
+  tcp:
+    host: 0.0.0.0
+    ports:
+      - 80
+      - 443
+
+security:
+  type: hmac  # none, hmac, or mutual
+  key: %env(TRANSPORT_SECRET)%
+  # For mutual auth:
+  # cert_dir: var/keys
