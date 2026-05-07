@@ -18,6 +18,15 @@ var (
 	ErrNotPaired        = errors.New("not paired with gateway")
 	ErrPairingRejected  = errors.New("pairing rejected")
 	ErrInvalidPairingID = errors.New("invalid pairing ID")
+	ErrNotPreApproved   = errors.New("app not pre-approved in strict mode")
+)
+
+type PairingMode string
+
+const (
+	PairingStrict  PairingMode = "strict"
+	PairingTrusted PairingMode = "trusted"
+	PairingOpen    PairingMode = "open"
 )
 
 const (
@@ -201,19 +210,35 @@ func (p *PairingManager) Unpair() error {
 }
 
 type GatewayPairingHandler struct {
-	apps       map[string]*PairingInfo
-	mu         sync.RWMutex
-	gatewayID  string
-	onPaired   func(appID, socketPath string, secret []byte) error
-	onUnpaired func(appID string)
+	apps        map[string]*PairingInfo
+	preApproved map[string][]byte
+	mode        PairingMode
+	mu          sync.RWMutex
+	gatewayID   string
+	onPaired    func(appID, socketPath string, secret []byte) error
+	onUnpaired  func(appID string)
 }
 
 func NewGatewayPairingHandler() *GatewayPairingHandler {
 	id := generateGatewayID()
 	return &GatewayPairingHandler{
-		apps:      make(map[string]*PairingInfo),
-		gatewayID: id,
+		apps:        make(map[string]*PairingInfo),
+		preApproved: make(map[string][]byte),
+		mode:        PairingStrict,
+		gatewayID:   id,
 	}
+}
+
+func (h *GatewayPairingHandler) SetMode(mode PairingMode) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.mode = mode
+}
+
+func (h *GatewayPairingHandler) Mode() PairingMode {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.mode
 }
 
 func generateGatewayID() string {
@@ -230,6 +255,48 @@ func (h *GatewayPairingHandler) OnUnpaired(cb func(appID string)) {
 	h.onUnpaired = cb
 }
 
+func (h *GatewayPairingHandler) PreApprove(appID string) ([]byte, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.preApproved[appID]; exists {
+		return nil, fmt.Errorf("%w: %s", ErrAlreadyPaired, appID)
+	}
+
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return nil, fmt.Errorf("failed to generate secret: %w", err)
+	}
+
+	h.preApproved[appID] = secret
+	return secret, nil
+}
+
+func (h *GatewayPairingHandler) RevokePreApproval(appID string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if _, exists := h.preApproved[appID]; !exists {
+		return fmt.Errorf("%w: %s", ErrNotPreApproved, appID)
+	}
+
+	delete(h.preApproved, appID)
+	delete(h.apps, appID)
+
+	if h.onUnpaired != nil {
+		h.onUnpaired(appID)
+	}
+
+	return nil
+}
+
+func (h *GatewayPairingHandler) IsPreApproved(appID string) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.preApproved[appID]
+	return ok
+}
+
 func (h *GatewayPairingHandler) HandlePairing(conn net.Conn) error {
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
@@ -244,8 +311,9 @@ func (h *GatewayPairingHandler) HandlePairing(conn net.Conn) error {
 
 	h.mu.Lock()
 	existing, exists := h.apps[req.AppID]
+	h.mu.Unlock()
+
 	if exists {
-		h.mu.Unlock()
 		resp := PairingResponse{
 			Type:      "pairing_response",
 			Accepted:  true,
@@ -256,12 +324,32 @@ func (h *GatewayPairingHandler) HandlePairing(conn net.Conn) error {
 		conn.Write(data)
 		return nil
 	}
-	h.mu.Unlock()
 
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		return err
+	accepted, rejectReason := h.shouldAcceptPairing(req, conn)
+	if !accepted {
+		resp := PairingResponse{
+			Type:     "pairing_response",
+			Accepted: false,
+			Error:    rejectReason,
+		}
+		data, _ := json.Marshal(resp)
+		conn.Write(data)
+		return fmt.Errorf("%w: %s", ErrPairingRejected, rejectReason)
 	}
+
+	var secret []byte
+	h.mu.RLock()
+	if preSecret, ok := h.preApproved[req.AppID]; ok {
+		secret = make([]byte, len(preSecret))
+		copy(secret, preSecret)
+	} else {
+		secret = make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			h.mu.RUnlock()
+			return err
+		}
+	}
+	h.mu.RUnlock()
 
 	info := &PairingInfo{
 		AppID:      req.AppID,
@@ -298,6 +386,63 @@ func (h *GatewayPairingHandler) HandlePairing(conn net.Conn) error {
 	conn.Write(data)
 
 	return nil
+}
+
+func (h *GatewayPairingHandler) shouldAcceptPairing(req PairingRequest, conn net.Conn) (bool, string) {
+	h.mu.RLock()
+	mode := h.mode
+	_, preApproved := h.preApproved[req.AppID]
+	h.mu.RUnlock()
+
+	switch mode {
+	case PairingOpen:
+		return true, ""
+
+	case PairingTrusted:
+		if isLocalConnection(conn) {
+			return true, ""
+		}
+		if preApproved {
+			return true, ""
+		}
+		return false, fmt.Sprintf("app %q not in trusted network (mode: trusted)", req.AppID)
+
+	case PairingStrict:
+		if preApproved {
+			return true, ""
+		}
+		return false, fmt.Sprintf("app %q must be pre-approved via 'gmcore app pair %s'", req.AppID, req.AppName)
+
+	default:
+		return false, fmt.Sprintf("unknown pairing mode: %s", mode)
+	}
+}
+
+func isLocalConnection(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return false
+	}
+
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		return a.IP.IsLoopback()
+	case *net.UnixAddr:
+		return true
+	default:
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			return false
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return false
+		}
+		return ip.IsLoopback()
+	}
 }
 
 func (h *GatewayPairingHandler) GetPairedApps() map[string]*PairingInfo {

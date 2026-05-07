@@ -23,36 +23,30 @@ type LifecycleResponse struct {
 }
 
 type LifecycleHandler struct {
-	onStart   func() error
-	onStop    func() error
-	onRestart func() error
-	onStatus  func() (map[string]any, error)
-	onReload  func() error
+	onStart        func() error
+	onStop         func() error
+	onRestart      func() error
+	onStatus       func() (map[string]any, error)
+	onReload       func() error
+	onPair         func(app string) ([]byte, error)
+	onUnpair       func(app string) error
+	onPairGenerate func() (string, error)
+	onPairAccept   func(code, client string) ([]byte, error)
 }
 
 func NewLifecycleHandler() *LifecycleHandler {
 	return &LifecycleHandler{}
 }
 
-func (h *LifecycleHandler) OnStart(cb func() error) {
-	h.onStart = cb
-}
-
-func (h *LifecycleHandler) OnStop(cb func() error) {
-	h.onStop = cb
-}
-
-func (h *LifecycleHandler) OnRestart(cb func() error) {
-	h.onRestart = cb
-}
-
-func (h *LifecycleHandler) OnStatus(cb func() (map[string]any, error)) {
-	h.onStatus = cb
-}
-
-func (h *LifecycleHandler) OnReload(cb func() error) {
-	h.onReload = cb
-}
+func (h *LifecycleHandler) OnStart(cb func() error)               { h.onStart = cb }
+func (h *LifecycleHandler) OnStop(cb func() error)                { h.onStop = cb }
+func (h *LifecycleHandler) OnRestart(cb func() error)             { h.onRestart = cb }
+func (h *LifecycleHandler) OnStatus(cb func() (map[string]any, error)) { h.onStatus = cb }
+func (h *LifecycleHandler) OnReload(cb func() error)              { h.onReload = cb }
+func (h *LifecycleHandler) OnPair(cb func(app string) ([]byte, error)) { h.onPair = cb }
+func (h *LifecycleHandler) OnUnpair(cb func(app string) error)    { h.onUnpair = cb }
+func (h *LifecycleHandler) OnPairGenerate(cb func() (string, error)) { h.onPairGenerate = cb }
+func (h *LifecycleHandler) OnPairAccept(cb func(code, client string) ([]byte, error)) { h.onPairAccept = cb }
 
 func (h *LifecycleHandler) Handle(cmd string, payload []byte) ([]byte, error) {
 	action := strings.TrimSpace(cmd)
@@ -119,6 +113,100 @@ func (h *LifecycleHandler) Handle(cmd string, payload []byte) ([]byte, error) {
 				resp = LifecycleResponse{Success: false, Status: "error", Error: err.Error()}
 			} else {
 				resp = LifecycleResponse{Success: true, Status: "ok", Data: data}
+			}
+		}
+
+	case "pair":
+		if h.onPair == nil {
+			resp = LifecycleResponse{Success: false, Status: "error", Error: "pair handler not set"}
+		} else {
+			appName := ""
+			if len(payload) > 0 {
+				var cmd LifecycleCommand
+				if err := json.Unmarshal(payload, &cmd); err == nil {
+					var p struct {
+						App string `json:"app"`
+					}
+					if err := json.Unmarshal(cmd.Payload, &p); err == nil && p.App != "" {
+						appName = p.App
+					}
+				}
+			}
+			if appName == "" {
+				resp = LifecycleResponse{Success: false, Status: "error", Error: "app name required for pair command"}
+			} else {
+				secret, err := h.onPair(appName)
+				if err != nil {
+					resp = LifecycleResponse{Success: false, Status: "error", Error: err.Error()}
+				} else {
+					resp = LifecycleResponse{Success: true, Status: "paired", Data: map[string]any{"secret": string(secret)}}
+				}
+			}
+		}
+
+	case "unpair":
+		if h.onUnpair == nil {
+			resp = LifecycleResponse{Success: false, Status: "error", Error: "unpair handler not set"}
+		} else {
+			appName := ""
+			if len(payload) > 0 {
+				var cmd LifecycleCommand
+				if err := json.Unmarshal(payload, &cmd); err == nil {
+					var p struct {
+						App string `json:"app"`
+					}
+					if err := json.Unmarshal(cmd.Payload, &p); err == nil && p.App != "" {
+						appName = p.App
+					}
+				}
+			}
+			if appName == "" {
+				resp = LifecycleResponse{Success: false, Status: "error", Error: "app name required for unpair command"}
+			} else {
+				if err := h.onUnpair(appName); err != nil {
+					resp = LifecycleResponse{Success: false, Status: "error", Error: err.Error()}
+				} else {
+					resp = LifecycleResponse{Success: true, Status: "unpaired"}
+				}
+			}
+		}
+
+	case "pair_generate":
+		if h.onPairGenerate == nil {
+			resp = LifecycleResponse{Success: false, Status: "error", Error: "pair generate handler not set"}
+		} else {
+			code, err := h.onPairGenerate()
+			if err != nil {
+				resp = LifecycleResponse{Success: false, Status: "error", Error: err.Error()}
+			} else {
+				resp = LifecycleResponse{Success: true, Status: "code_generated", Data: map[string]any{"code": code}}
+			}
+		}
+
+	case "pair_accept":
+		if h.onPairAccept == nil {
+			resp = LifecycleResponse{Success: false, Status: "error", Error: "pair accept handler not set"}
+		} else {
+			code := ""
+			client := ""
+			if len(payload) > 0 {
+				var cmd LifecycleCommand
+				json.Unmarshal(payload, &cmd)
+				if cmd.Payload != nil {
+					var p struct {
+						Code   string `json:"code"`
+						Client string `json:"client"`
+					}
+					json.Unmarshal(cmd.Payload, &p)
+					code = p.Code
+					client = p.Client
+				}
+			}
+			secret, err := h.onPairAccept(code, client)
+			if err != nil {
+				resp = LifecycleResponse{Success: false, Status: "error", Error: err.Error()}
+			} else {
+				resp = LifecycleResponse{Success: true, Status: "paired", Data: map[string]any{"secret": string(secret)}}
 			}
 		}
 
@@ -284,4 +372,18 @@ func (g *GatewayTransport) Close() error {
 	}
 
 	return nil
+}
+
+func HandleDiscoveryCommand(cmd string, discovery *Discovery) string {
+	switch strings.TrimSpace(strings.ToLower(cmd)) {
+	case "peers", "discover", "list":
+		if discovery == nil {
+			return `{"error":"discovery not configured"}`
+		}
+		peers := discovery.Peers()
+		data, _ := json.MarshalIndent(peers, "", "  ")
+		return string(data)
+	default:
+		return fmt.Sprintf(`{"error":"unknown discovery command: %s"}`, cmd)
+	}
 }

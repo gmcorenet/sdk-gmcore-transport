@@ -447,6 +447,133 @@ func TestErrorConstants(t *testing.T) {
 	}
 }
 
+func TestPairingModes(t *testing.T) {
+	if PairingStrict != "strict" {
+		t.Errorf("expected 'strict', got %s", PairingStrict)
+	}
+	if PairingTrusted != "trusted" {
+		t.Errorf("expected 'trusted', got %s", PairingTrusted)
+	}
+	if PairingOpen != "open" {
+		t.Errorf("expected 'open', got %s", PairingOpen)
+	}
+}
+
+func TestGatewayPairingHandler_DefaultMode(t *testing.T) {
+	h := NewGatewayPairingHandler()
+	if h.Mode() != PairingStrict {
+		t.Errorf("expected strict mode by default, got %s", h.Mode())
+	}
+}
+
+func TestGatewayPairingHandler_SetMode(t *testing.T) {
+	h := NewGatewayPairingHandler()
+	h.SetMode(PairingOpen)
+	if h.Mode() != PairingOpen {
+		t.Errorf("expected open mode, got %s", h.Mode())
+	}
+}
+
+func TestGatewayPairingHandler_PreApprove(t *testing.T) {
+	h := NewGatewayPairingHandler()
+
+	secret, err := h.PreApprove("testapp")
+	if err != nil {
+		t.Fatalf("PreApprove failed: %v", err)
+	}
+	if len(secret) != 32 {
+		t.Errorf("expected 32-byte secret, got %d", len(secret))
+	}
+	if !h.IsPreApproved("testapp") {
+		t.Error("expected testapp to be pre-approved")
+	}
+}
+
+func TestGatewayPairingHandler_PreApproveDuplicate(t *testing.T) {
+	h := NewGatewayPairingHandler()
+
+	_, err := h.PreApprove("testapp")
+	if err != nil {
+		t.Fatalf("first PreApprove failed: %v", err)
+	}
+
+	_, err = h.PreApprove("testapp")
+	if err == nil {
+		t.Error("expected error on duplicate PreApprove")
+	}
+}
+
+func TestGatewayPairingHandler_RevokePreApproval(t *testing.T) {
+	h := NewGatewayPairingHandler()
+
+	_, err := h.PreApprove("testapp")
+	if err != nil {
+		t.Fatalf("PreApprove failed: %v", err)
+	}
+
+	err = h.RevokePreApproval("testapp")
+	if err != nil {
+		t.Fatalf("RevokePreApproval failed: %v", err)
+	}
+	if h.IsPreApproved("testapp") {
+		t.Error("expected testapp to NOT be pre-approved")
+	}
+}
+
+func TestGatewayPairingHandler_RevokePreApprovalNotFound(t *testing.T) {
+	h := NewGatewayPairingHandler()
+	err := h.RevokePreApproval("nonexistent")
+	if err == nil {
+		t.Error("expected error revoking non-existent pre-approval")
+	}
+}
+
+func TestIsLocalConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("skipping: %v", err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			if !isLocalConnection(conn) {
+				t.Error("loopback TCP should be local")
+			}
+			conn.Close()
+		}
+		close(done)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+	<-done
+}
+
+func TestFilterPairedPeers(t *testing.T) {
+	peers := []Peer{
+		{Name: "paired-app", Secret: []byte("secret123")},
+		{Name: "unpaired-app", Secret: nil},
+		{Name: "another-paired", Secret: []byte("x")},
+	}
+
+	filtered := filterPairedPeers(peers)
+	if len(filtered) != 2 {
+		t.Errorf("expected 2 paired peers, got %d", len(filtered))
+	}
+	if filtered[0].Name != "paired-app" {
+		t.Errorf("expected paired-app first, got %s", filtered[0].Name)
+	}
+	if filtered[1].Name != "another-paired" {
+		t.Errorf("expected another-paired second, got %s", filtered[1].Name)
+	}
+}
+
 func listenDummyUnixSocket(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }

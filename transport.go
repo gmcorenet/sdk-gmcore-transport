@@ -74,11 +74,12 @@ type FullConfig struct {
 }
 
 type Transport struct {
-	config  Config
-	server  *Server
-	sec     SecurityProvider
-	handler CommandHandler
-	mu      sync.RWMutex
+	config    Config
+	server    *Server
+	sec       SecurityProvider
+	handler   CommandHandler
+	discovery *Discovery
+	mu        sync.RWMutex
 }
 
 func New(cfg Config) *Transport {
@@ -93,6 +94,36 @@ func (t *Transport) UseSecurity(s SecurityProvider) {
 
 func (t *Transport) SetHandler(h CommandHandler) {
 	t.handler = h
+}
+
+func (t *Transport) WithDiscovery(cfg DiscoveryConfig) *Transport {
+	t.discovery = NewDiscovery(cfg)
+	return t
+}
+
+func (t *Transport) Register(name, host string, port int) error {
+	if t.discovery == nil {
+		return fmt.Errorf("discovery not configured")
+	}
+	return t.discovery.Register(name, host, port)
+}
+
+func (t *Transport) Discover(name string) (Peer, error) {
+	if t.discovery == nil {
+		return Peer{}, fmt.Errorf("discovery not configured")
+	}
+	return t.discovery.Discover(name)
+}
+
+func (t *Transport) Peers() []Peer {
+	if t.discovery == nil {
+		return nil
+	}
+	return t.discovery.Peers()
+}
+
+func (t *Transport) Dial(name string) (net.Conn, error) {
+	return t.discovery.Dial(name)
 }
 
 func (t *Transport) Listen(ctx context.Context) error {
